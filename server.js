@@ -3,6 +3,7 @@ import cors from 'cors';
 import YTMusic from 'ytmusic-api';
 import axios from 'axios';
 import ytdl from '@distube/ytdl-core';
+import rateLimit from 'express-rate-limit';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,9 +12,70 @@ const PORT = process.env.PORT || 3000;
 const ytmusic = new YTMusic();
 let isInitialized = false;
 
+// Rate limiter configuration - prevent hitting YouTube's rate limits
+const limiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 30, // limit each IP to 30 requests per minute
+    message: { error: 'Too many requests, please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// Apply rate limiter to all API routes
+app.use('/api/', limiter);
+
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// YouTube client names to try (rotating helps avoid rate limits)
+const YOUTUBE_CLIENTS = ['ANDROID', 'ANDROID_MUSIC', 'WEB', 'WEB_CREATOR'];
+let clientIndex = 0;
+
+// Get next client name (round-robin)
+function getNextClient() {
+    const client = YOUTUBE_CLIENTS[clientIndex];
+    clientIndex = (clientIndex + 1) % YOUTUBE_CLIENTS.length;
+    return client;
+}
+
+// Helper function to get YouTube info with retry logic
+async function getYouTubeInfo(videoId, retryCount = 3) {
+    let lastError;
+    
+    for (let i = 0; i < retryCount; i++) {
+        const clientName = getNextClient();
+        try {
+            console.log(`🎬 Trying YouTube client: ${clientName} (attempt ${i + 1})`);
+            const info = await ytdl.getInfo(videoId, {
+                requestOptions: { clientName }
+            });
+            return { info, clientName };
+        } catch (error) {
+            lastError = error;
+            console.warn(`⚠️ Client ${clientName} failed: ${error.message}`);
+            
+            if (error.statusCode === 429) {
+                // Rate limited - wait longer before retry
+                const waitTime = Math.pow(2, i) * 2000; // 2s, 4s, 8s
+                console.log(`⏳ Rate limited! Waiting ${waitTime}ms before retry...`);
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+            } else if (error.statusCode === 403 && i < retryCount - 1) {
+                // Forbidden - try different client
+                const waitTime = Math.pow(2, i) * 1000;
+                console.log(`⏳ 403 Forbidden. Waiting ${waitTime}ms before trying different client...`);
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+            } else if (i < retryCount - 1) {
+                // Other error - short delay
+                const waitTime = Math.pow(2, i) * 1000;
+                console.log(`⏳ Error. Waiting ${waitTime}ms before retry...`);
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+            }
+        }
+    }
+    
+    throw lastError;
+}
 
 // Initialize YTMusic on startup
 async function initializeYTMusic() {
@@ -205,9 +267,9 @@ app.get('/api/stream/:videoId', async (req, res) => {
 
         console.log(`🎯 Using YouTube as audio source`);
         
-        const info = await ytdl.getInfo(videoId, {
-            requestOptions: { clientName: 'ANDROID' }
-        });
+        // Use the helper function with retry logic
+        const { info, clientName } = await getYouTubeInfo(videoId, 3);
+        console.log(`✅ Successfully got info using client: ${clientName}`);
         
         const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
         const bestAudio = audioFormats[0];
@@ -272,9 +334,9 @@ app.get('/api/proxy/:videoId', async (req, res) => {
         res.setHeader('Content-Type', 'video/mp4');
         res.setHeader('Accept-Ranges', 'bytes');
 
-        const info = await ytdl.getInfo(videoId, {
-            requestOptions: { clientName: 'ANDROID' }
-        });
+        // Use the helper function with retry logic
+        const { info, clientName } = await getYouTubeInfo(videoId, 3);
+        console.log(`✅ Successfully got info using client: ${clientName}`);
 
         const format = ytdl.chooseFormat(info.formats, {
             format: 'best[ext=mp4]/best',
@@ -289,7 +351,7 @@ app.get('/api/proxy/:videoId', async (req, res) => {
 
         const stream = ytdl.downloadFromInfo(info, {
             format: format,
-            requestOptions: { clientName: 'ANDROID' }
+            requestOptions: { clientName }
         });
 
         stream.on('error', (err) => {
