@@ -34,14 +34,26 @@ let clientIndex = 0;
 
 // Invidious/Piped instances (fallback when YouTube is blocked)
 const INVIDIOUS_INSTANCES = [
-    'https://invidious.fdn.fr',
-    'https://invidious.jingl.xyz',
     'https://invidious.kavin.rocks',
     'https://invidious.snopyta.org',
-    'https://yewtu.be'
+    'https://yewtu.be',
+    'https://invidious.projectsegfau.lt',
+    'https://iv.datura.network',
+    'https://invidious.tube',
+    'https://invidious.namazso.eu',
+];
+
+// Piped instances (more reliable alternative)
+const PIPED_INSTANCES = [
+    'https://pipedapi.kavin.rocks',
+    'https://pipedapi.adminforge.de',
+    'https://watchapi.whatever.social',
+    'https://api.piped.yt',
+    'https://pipedapi.lunar.icu',
 ];
 
 let invidiousIndex = 0;
+let pipedIndex = 0;
 
 // Get next client name (round-robin)
 function getNextClient() {
@@ -54,6 +66,13 @@ function getNextClient() {
 function getNextInvidious() {
     const instance = INVIDIOUS_INSTANCES[invidiousIndex];
     invidiousIndex = (invidiousIndex + 1) % INVIDIOUS_INSTANCES.length;
+    return instance;
+}
+
+// Get next Piped instance
+function getNextPiped() {
+    const instance = PIPED_INSTANCES[pipedIndex];
+    pipedIndex = (pipedIndex + 1) % PIPED_INSTANCES.length;
     return instance;
 }
 
@@ -95,10 +114,50 @@ async function getYouTubeInfo(videoId, retryCount = 5) {
     throw lastError;
 }
 
-// Try Invidious as fallback when YouTube is completely blocked
+// Try Invidious/Piped as fallback when YouTube is completely blocked
 async function getStreamFromInvidious(videoId) {
-    console.log(`🔄 YouTube blocked, trying Invidious...`);
+    console.log(`🔄 YouTube blocked, trying Invidious/Piped...`);
     
+    // Try Piped first (usually more reliable)
+    console.log(`🔄 Trying Piped API...`);
+    for (let i = 0; i < PIPED_INSTANCES.length; i++) {
+        const instance = getNextPiped();
+        try {
+            console.log(`🌐 Trying Piped instance: ${instance}`);
+            
+            // Get streams from Piped
+            const response = await axios.get(`${instance}/streams/${videoId}`, {
+                timeout: 15000,
+                headers: {
+                    'User-Agent': 'Echo/1.0'
+                }
+            });
+            
+            if (response.data && response.data.audioStreams) {
+                const audioStreams = response.data.audioStreams;
+                if (audioStreams.length > 0) {
+                    // Sort by bitrate and get best
+                    audioStreams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+                    const bestAudio = audioStreams[0];
+                    
+                    console.log(`✅ Found audio via Piped: ${bestAudio.format} - ${Math.round((bestAudio.bitrate || 128000)/1000)}kbps`);
+                    
+                    return {
+                        success: true,
+                        url: bestAudio.url,
+                        method: 'piped',
+                        instance: instance,
+                        title: response.data.title || videoId
+                    };
+                }
+            }
+        } catch (error) {
+            console.warn(`⚠️ Piped instance ${instance} failed: ${error.message}`);
+        }
+    }
+    
+    // Try Invidious as fallback
+    console.log(`🔄 Trying Invidious API...`);
     for (let i = 0; i < INVIDIOUS_INSTANCES.length; i++) {
         const instance = getNextInvidious();
         try {
@@ -106,12 +165,15 @@ async function getStreamFromInvidious(videoId) {
             
             // Get video info
             const response = await axios.get(`${instance}/api/v1/videos/${videoId}`, {
-                timeout: 10000
+                timeout: 15000,
+                headers: {
+                    'User-Agent': 'Echo/1.0'
+                }
             });
             
             if (response.data && response.data.adaptiveFormats) {
                 // Find best audio format
-                const audioFormats = response.data.adaptiveFormats.filter(f => f.type.startsWith('audio'));
+                const audioFormats = response.data.adaptiveFormats.filter(f => f.type && f.type.startsWith('audio'));
                 if (audioFormats.length > 0) {
                     // Sort by bitrate and get best
                     audioFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
