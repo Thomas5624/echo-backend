@@ -29,8 +29,19 @@ app.use(cors());
 app.use(express.json());
 
 // YouTube client names to try (rotating helps avoid rate limits)
-const YOUTUBE_CLIENTS = ['ANDROID', 'ANDROID_MUSIC', 'WEB', 'WEB_CREATOR'];
+const YOUTUBE_CLIENTS = ['ANDROID', 'ANDROID_MUSIC', 'WEB', 'WEB_CREATOR', 'TV', 'DESKTOP'];
 let clientIndex = 0;
+
+// Invidious/Piped instances (fallback when YouTube is blocked)
+const INVIDIOUS_INSTANCES = [
+    'https://invidious.fdn.fr',
+    'https://invidious.jingl.xyz',
+    'https://invidious.kavin.rocks',
+    'https://invidious.snopyta.org',
+    'https://yewtu.be'
+];
+
+let invidiousIndex = 0;
 
 // Get next client name (round-robin)
 function getNextClient() {
@@ -39,8 +50,15 @@ function getNextClient() {
     return client;
 }
 
+// Get next Invidious instance
+function getNextInvidious() {
+    const instance = INVIDIOUS_INSTANCES[invidiousIndex];
+    invidiousIndex = (invidiousIndex + 1) % INVIDIOUS_INSTANCES.length;
+    return instance;
+}
+
 // Helper function to get YouTube info with retry logic
-async function getYouTubeInfo(videoId, retryCount = 3) {
+async function getYouTubeInfo(videoId, retryCount = 5) {
     let lastError;
     
     for (let i = 0; i < retryCount; i++) {
@@ -50,14 +68,14 @@ async function getYouTubeInfo(videoId, retryCount = 3) {
             const info = await ytdl.getInfo(videoId, {
                 requestOptions: { clientName }
             });
-            return { info, clientName };
+            return { info, clientName, method: 'ytdl' };
         } catch (error) {
             lastError = error;
             console.warn(`⚠️ Client ${clientName} failed: ${error.message}`);
             
             if (error.statusCode === 429) {
                 // Rate limited - wait longer before retry
-                const waitTime = Math.pow(2, i) * 2000; // 2s, 4s, 8s
+                const waitTime = Math.pow(2, i) * 2000; // 2s, 4s, 8s, 16s, 32s
                 console.log(`⏳ Rate limited! Waiting ${waitTime}ms before retry...`);
                 await new Promise(resolve => setTimeout(resolve, waitTime));
             } else if (error.statusCode === 403 && i < retryCount - 1) {
@@ -75,6 +93,47 @@ async function getYouTubeInfo(videoId, retryCount = 3) {
     }
     
     throw lastError;
+}
+
+// Try Invidious as fallback when YouTube is completely blocked
+async function getStreamFromInvidious(videoId) {
+    console.log(`🔄 YouTube blocked, trying Invidious...`);
+    
+    for (let i = 0; i < INVIDIOUS_INSTANCES.length; i++) {
+        const instance = getNextInvidious();
+        try {
+            console.log(`🌐 Trying Invidious instance: ${instance}`);
+            
+            // Get video info
+            const response = await axios.get(`${instance}/api/v1/videos/${videoId}`, {
+                timeout: 10000
+            });
+            
+            if (response.data && response.data.adaptiveFormats) {
+                // Find best audio format
+                const audioFormats = response.data.adaptiveFormats.filter(f => f.type.startsWith('audio'));
+                if (audioFormats.length > 0) {
+                    // Sort by bitrate and get best
+                    audioFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+                    const bestAudio = audioFormats[0];
+                    
+                    console.log(`✅ Found audio via Invidious: ${bestAudio.container} - ${Math.round((bestAudio.bitrate || 128000)/1000)}kbps`);
+                    
+                    return {
+                        success: true,
+                        url: bestAudio.url,
+                        method: 'invidious',
+                        instance: instance,
+                        title: response.data.title
+                    };
+                }
+            }
+        } catch (error) {
+            console.warn(`⚠️ Invidious instance ${instance} failed: ${error.message}`);
+        }
+    }
+    
+    return null;
 }
 
 // Initialize YTMusic on startup
@@ -267,26 +326,49 @@ app.get('/api/stream/:videoId', async (req, res) => {
 
         console.log(`🎯 Using YouTube as audio source`);
         
-        // Use the helper function with retry logic
-        const { info, clientName } = await getYouTubeInfo(videoId, 3);
-        console.log(`✅ Successfully got info using client: ${clientName}`);
+        let streamData = null;
         
-        const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
-        const bestAudio = audioFormats[0];
-        
-        if (bestAudio) {
-            console.log(`✅ Found audio format: ${bestAudio.container} - ${Math.round(bestAudio.bitrate/1000)}kbps`);
+        // Try YouTube first with retry logic
+        try {
+            const { info, clientName } = await getYouTubeInfo(videoId, 5);
+            console.log(`✅ Successfully got info using client: ${clientName}`);
+            
+            const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
+            const bestAudio = audioFormats[0];
+            
+            if (bestAudio) {
+                console.log(`✅ Found audio format: ${bestAudio.container} - ${Math.round(bestAudio.bitrate/1000)}kbps`);
+            }
+
+            const ytStreamUrl = `${req.protocol}://${req.get('host')}/api/proxy/${videoId}`;
+
+            return res.json({
+                success: true,
+                url: ytStreamUrl,
+                quality: bestAudio ? `${Math.round(bestAudio.bitrate/1000)}kbps` : '128kbps',
+                source: 'YouTube (ytdl-core)',
+                title: info.videoDetails.title
+            });
+        } catch (ytError) {
+            // If YouTube fails completely, try Invidious
+            console.log(`❌ YouTube failed: ${ytError.message}`);
+            console.log(`🔄 Trying Invidious fallback...`);
+            
+            streamData = await getStreamFromInvidious(videoId);
+            
+            if (streamData) {
+                return res.json({
+                    success: true,
+                    url: streamData.url,
+                    quality: '128kbps',
+                    source: `Invidious (${streamData.instance})`,
+                    title: streamData.title
+                });
+            }
+            
+            // If both fail, return error
+            throw ytError;
         }
-
-        const ytStreamUrl = `${req.protocol}://${req.get('host')}/api/proxy/${videoId}`;
-
-        return res.json({
-            success: true,
-            url: ytStreamUrl,
-            quality: bestAudio ? `${Math.round(bestAudio.bitrate/1000)}kbps` : '128kbps',
-            source: 'YouTube (ytdl-core)',
-            title: info.videoDetails.title
-        });
 
     } catch (error) {
         console.error('❌ Get stream error:', error);
@@ -334,34 +416,52 @@ app.get('/api/proxy/:videoId', async (req, res) => {
         res.setHeader('Content-Type', 'video/mp4');
         res.setHeader('Accept-Ranges', 'bytes');
 
-        // Use the helper function with retry logic
-        const { info, clientName } = await getYouTubeInfo(videoId, 3);
-        console.log(`✅ Successfully got info using client: ${clientName}`);
+        // Try YouTube first with retry logic
+        try {
+            // Use the helper function with retry logic
+            const { info, clientName } = await getYouTubeInfo(videoId, 5);
+            console.log(`✅ Successfully got info using client: ${clientName}`);
 
-        const format = ytdl.chooseFormat(info.formats, {
-            format: 'best[ext=mp4]/best',
-            quality: 'highest'
-        });
+            const format = ytdl.chooseFormat(info.formats, {
+                format: 'best[ext=mp4]/best',
+                quality: 'highest'
+            });
 
-        if (!format) {
-            return res.status(404).send('No suitable format found');
-        }
-
-        console.log(`🎵 Streaming: ${format.container} - ${format.bitrate}`);
-
-        const stream = ytdl.downloadFromInfo(info, {
-            format: format,
-            requestOptions: { clientName }
-        });
-
-        stream.on('error', (err) => {
-            console.error(`❌ Stream error: ${err.message}`);
-            if (!res.headersSent) {
-                res.status(500).send('Stream failed');
+            if (!format) {
+                return res.status(404).send('No suitable format found');
             }
-        });
 
-        stream.pipe(res);
+            console.log(`🎵 Streaming: ${format.container} - ${format.bitrate}`);
+
+            const stream = ytdl.downloadFromInfo(info, {
+                format: format,
+                requestOptions: { clientName }
+            });
+
+            stream.on('error', (err) => {
+                console.error(`❌ Stream error: ${err.message}`);
+                if (!res.headersSent) {
+                    res.status(500).send('Stream failed');
+                }
+            });
+
+            stream.pipe(res);
+        } catch (ytError) {
+            // If YouTube fails, try Invidious
+            console.log(`❌ YouTube proxy failed: ${ytError.message}`);
+            console.log(`🔄 Trying Invidious fallback...`);
+            
+            const streamData = await getStreamFromInvidious(videoId);
+            
+            if (streamData) {
+                console.log(`✅ Streaming via Invidious: ${streamData.url}`);
+                
+                // Redirect to Invidious stream URL
+                res.redirect(streamData.url);
+            } else {
+                throw ytError;
+            }
+        }
 
     } catch (error) {
         console.error(`❌ Proxy error: ${error.message}`);
